@@ -1,4 +1,4 @@
-import React from 'react';
+
 import { Link, useLocation } from 'react-router-dom';
 import { Leaf } from 'lucide-react';
 import { Button } from '../Button';
@@ -44,12 +44,12 @@ export function TopNav() {
         </nav>
 
         <div className="hidden md:flex items-center gap-4">
-          <Button
-            asChild
-            className="rounded-full bg-primary text-primary-foreground hover:bg-primary/90">
-            
-            <Link to="/scan">Start Scanning</Link>
-          </Button>
+          <Link to="/scan">
+            <Button
+              className="rounded-full bg-primary text-primary-foreground hover:bg-primary/90">
+              Start Scanning
+            </Button>
+          </Link>
         </div>
       </div>
     </header>);
