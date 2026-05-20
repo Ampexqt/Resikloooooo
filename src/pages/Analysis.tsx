@@ -1,10 +1,8 @@
-import React from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useLocation } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import {
   Sprout,
   Wrench,
-  Heart,
   Recycle,
   ArrowRight,
   Leaf,
@@ -13,8 +11,19 @@ import {
 import { Badge } from '../components/Badge';
 import { Button } from '../components/Button';
 import { mockSuggestions } from '../lib/mockData';
+
 export function Analysis() {
-  const data = mockSuggestions.plasticBottle;
+  const location = useLocation();
+  const state = location.state || {};
+  const dynamicAnalysis = state.analysis;
+  const image = state.imageUrl || 'https://images.unsplash.com/photo-1528323273322-d81458248d40?auto=format&fit=crop&q=80&w=800';
+
+  const data = dynamicAnalysis || mockSuggestions.plasticBottle;
+
+  // Split safely in case there's no dot separator
+  const itemTitle = data.item ? (data.item.includes('·') ? data.item.split('·')[0].trim() : data.item) : 'Detected Item';
+  const itemSubtitle = data.item && data.item.includes('·') ? data.item.split('·')[1].trim() : 'Recyclable';
+
   return (
     <div className="min-h-[calc(100vh-4rem)] bg-[#F6F8F5] pb-24">
       {/* Header */}
@@ -35,17 +44,15 @@ export function Analysis() {
           </div>
 
           {/* Demo toggle to see e-waste */}
-          <Button
-            asChild
-            variant="outline"
-            size="sm"
-            className="text-xs border-[#C65B4B]/30 text-[#C65B4B] hover:bg-[#C65B4B]/5 w-fit">
-            
-            <Link to="/analysis/ewaste">
+          <Link to="/analysis/ewaste">
+            <Button
+              variant="outline"
+              size="sm"
+              className="text-xs border-[#C65B4B]/30 text-[#C65B4B] hover:bg-[#C65B4B]/5 w-fit">
               <AlertCircle className="w-3 h-3 mr-2" />
               View E-Waste Demo
-            </Link>
-          </Button>
+            </Button>
+          </Link>
         </div>
       </div>
 
@@ -66,17 +73,17 @@ export function Analysis() {
               
               <div className="aspect-square rounded-2xl overflow-hidden relative bg-gray-100">
                 <img
-                  src="https://images.unsplash.com/photo-1528323273322-d81458248d40?auto=format&fit=crop&q=80&w=800"
+                  src={image}
                   alt="Scanned item"
                   className="w-full h-full object-cover" />
                 
                 <div className="absolute inset-0 bg-gradient-to-t from-black/60 to-transparent" />
                 <div className="absolute bottom-4 left-4 right-4">
                   <h2 className="text-white font-bold text-xl mb-1">
-                    {data.item.split('·')[0].trim()}
+                    {itemTitle}
                   </h2>
                   <p className="text-white/80 text-sm font-mono">
-                    {data.item.split('·')[1].trim()}
+                    {itemSubtitle}
                   </p>
                 </div>
               </div>
@@ -160,7 +167,7 @@ export function Analysis() {
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                {data.reuse.map((item, i) =>
+                {data.reuse.map((item: { title: string; desc: string }, i: number) =>
                 <div
                   key={i}
                   className="bg-white rounded-2xl p-5 shadow-sm border border-border/50 hover:border-[#2F6B5F]/30 transition-colors group cursor-pointer">
@@ -214,13 +221,13 @@ export function Analysis() {
                 <p className="text-[#1B1F1D] font-medium mb-4">
                   {data.recycle}
                 </p>
-                <Button
-                  asChild
-                  variant="outline"
-                  className="w-full sm:w-auto rounded-xl">
-                  
-                  <Link to="/map">Find Nearby Recycling Centers</Link>
-                </Button>
+                <Link to="/map" className="w-full sm:w-auto">
+                  <Button
+                    variant="outline"
+                    className="w-full rounded-xl">
+                    Find Nearby Recycling Centers
+                  </Button>
+                </Link>
               </div>
             </motion.section>
           </div>

@@ -1,9 +1,11 @@
-import React, { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useState } from 'react';
+import { useNavigate, useLocation } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Check, ArrowRight, ArrowLeft } from 'lucide-react';
 import { Button } from '../components/Button';
 import { Progress } from '../components/Progress';
+import { finalizeScan } from '../lib/api';
+
 const questions = [
 {
   id: 'functional',
@@ -67,19 +69,48 @@ const questions = [
 
 export function Validate() {
   const navigate = useNavigate();
+  const location = useLocation();
+  const state = location.state || {};
+  const scanId = state.scanId;
+  const imageUrl = state.imageUrl;
+  const imageBase64 = state.imageBase64;  // real base64 for Gemini
+  
+  // Use dynamic questions if passed in router state, otherwise fall back to static/mock questions
+  const questionsToUse = state.questions && state.questions.length > 0 ? state.questions : questions;
+  
   const [currentStep, setCurrentStep] = useState(0);
   const [answers, setAnswers] = useState<Record<string, string>>({});
-  const question = questions[currentStep];
-  const progress = (currentStep + 1) / questions.length * 100;
-  const isLastStep = currentStep === questions.length - 1;
-  const hasAnsweredCurrent = !!answers[question.id];
-  const handleNext = () => {
+  const [isFinalizing, setIsFinalizing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const question = questionsToUse[currentStep];
+  const progress = questionsToUse.length > 0 ? ((currentStep + 1) / questionsToUse.length * 100) : 0;
+  const isLastStep = questionsToUse.length > 0 ? (currentStep === questionsToUse.length - 1) : true;
+  const hasAnsweredCurrent = question ? !!answers[question.id] : false;
+
+  const handleNext = async () => {
     if (isLastStep) {
-      navigate('/analysis');
+      setIsFinalizing(true);
+      setError(null);
+      try {
+        // Send answers to final analysis endpoint — pass imageBase64 so Gemini can run real analysis
+        const analysisResult = await finalizeScan(scanId, answers, imageBase64 || imageUrl);
+        navigate('/analysis', {
+          state: {
+            analysis: analysisResult,
+            imageUrl: imageUrl
+          }
+        });
+      } catch (err: any) {
+        console.error(err);
+        setError(err.message || 'Analysis finalization failed. Please try again.');
+        setIsFinalizing(false);
+      }
     } else {
       setCurrentStep((prev) => prev + 1);
     }
   };
+
   const handleBack = () => {
     if (currentStep > 0) {
       setCurrentStep((prev) => prev - 1);
@@ -87,6 +118,23 @@ export function Validate() {
       navigate('/scan');
     }
   };
+
+  if (isFinalizing) {
+    return (
+      <div className="min-h-[calc(100vh-4rem)] bg-[#F6F8F5] flex flex-col items-center justify-center p-4">
+        <div className="text-center max-w-md bg-white rounded-3xl p-8 shadow-sm border border-border/50 flex flex-col items-center justify-center min-h-[350px]">
+          <div className="w-16 h-16 rounded-full border-4 border-[#2F6B5F]/20 border-t-[#2F6B5F] animate-spin mb-6" />
+          <h2 className="font-heading text-2xl font-bold text-[#1B1F1D] mb-3">
+            Generating Analysis...
+          </h2>
+          <p className="text-[#66706A] text-sm">
+            Resiklo AI is analyzing your image and survey responses to create personalized recommendations.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-[calc(100vh-4rem)] bg-[#F6F8F5] flex flex-col items-center justify-center p-4">
       <div className="w-full max-w-lg">
@@ -98,7 +146,7 @@ export function Validate() {
             <ArrowLeft className="w-5 h-5" />
           </button>
           <div className="font-mono text-xs font-bold text-[#66706A] uppercase tracking-widest">
-            Step {currentStep + 1} of {questions.length}
+            Step {currentStep + 1} of {questionsToUse.length}
           </div>
           <div className="w-10" /> {/* Spacer for centering */}
         </div>
@@ -108,6 +156,14 @@ export function Validate() {
         </div>
 
         <div className="bg-white rounded-3xl p-6 md:p-8 shadow-sm border border-border/50 relative overflow-hidden min-h-[400px] flex flex-col">
+          {error && (
+            <div className="mb-6 p-4 bg-[#C65B4B]/10 border border-[#C65B4B]/20 text-[#C65B4B] rounded-2xl text-sm flex items-center justify-between">
+              <span>{error}</span>
+              <Button size="sm" variant="ghost" onClick={() => setError(null)} className="text-[#C65B4B] hover:bg-[#C65B4B]/10 p-1 h-auto">
+                Dismiss
+              </Button>
+            </div>
+          )}
           <AnimatePresence mode="wait">
             <motion.div
               key={currentStep}
@@ -136,7 +192,7 @@ export function Validate() {
               </div>
 
               <div className="space-y-3 flex-1">
-                {question.options.map((option) => {
+                {question.options.map((option: { value: string; label: string }) => {
                   const isSelected = answers[question.id] === option.value;
                   return (
                     <button

@@ -6,7 +6,7 @@
  * The functions return parsed JSON payloads directly.
  */
 
-const SERVER_URL = process.env.REACT_APP_BACKEND_URL || "http://localhost:5000";
+const SERVER_URL = (import.meta as any).env?.VITE_BACKEND_URL || "http://localhost:5000";
 
 /** Upload an image file (or a base64 string) and receive a Scan ID */
 export async function uploadImage(
@@ -52,6 +52,49 @@ export async function analyzeScan(
   if (!resp.ok) {
     const err = await resp.json();
     throw new Error(err.error || "Scan analysis failed");
+  }
+  return resp.json();
+}
+
+/** Request initial Gemini scanning and get dynamic questions */
+export async function initiateScan(
+  scanId: string,
+  imageBase64?: string
+): Promise<{ success: boolean; scanId: string; objectType: string; confidence: number; isEwaste: boolean; questions: any[] }> {
+  const payload: any = { scanId };
+  if (imageBase64) payload.imageBase64 = imageBase64;
+
+  const resp = await fetch(`${SERVER_URL}/api/scan/initiate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    credentials: "include"
+  });
+  if (!resp.ok) {
+    const err = await resp.json();
+    throw new Error(err.error || "Scan initiation failed");
+  }
+  return resp.json();
+}
+
+/** Submit survey answers to receive the final Gemini analysis */
+export async function finalizeScan(
+  scanId: string,
+  answers: Record<string, string>,
+  imageBase64?: string
+): Promise<any> {
+  const payload: any = { scanId, answers };
+  if (imageBase64) payload.imageBase64 = imageBase64;
+
+  const resp = await fetch(`${SERVER_URL}/api/scan/finalize`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    credentials: "include"
+  });
+  if (!resp.ok) {
+    const err = await resp.json();
+    throw new Error(err.error || "Scan finalization failed");
   }
   return resp.json();
 }
