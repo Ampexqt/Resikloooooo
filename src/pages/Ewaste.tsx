@@ -1,9 +1,7 @@
-import React from 'react';
 import { Link } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import {
   AlertTriangle,
-  Battery,
   MapPin,
   ShieldAlert,
   ArrowLeft,
@@ -20,16 +18,14 @@ export function Ewaste() {
       {/* Header */}
       <div className="border-b border-white/10 pt-8 pb-6 sticky top-16 z-40 bg-[#111312]/80 backdrop-blur-md">
         <div className="container flex items-center gap-4">
-          <Button
-            asChild
-            variant="ghost"
-            size="icon"
-            className="text-white/60 hover:text-white hover:bg-white/10 rounded-full">
-            
-            <Link to="/analysis">
+          <Link to="/analysis">
+            <Button
+              variant="ghost"
+              size="icon"
+              className="text-white/60 hover:text-white hover:bg-white/10 rounded-full">
               <ArrowLeft className="w-5 h-5" />
-            </Link>
-          </Button>
+            </Button>
+          </Link>
           <div>
             <div className="flex items-center gap-3 mb-1">
               <h1 className="font-heading text-2xl font-bold text-white">

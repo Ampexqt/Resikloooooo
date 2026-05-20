@@ -50,6 +50,112 @@ if (supabaseUrl && supabaseServiceKey && !supabaseUrl.includes('your_project_id'
   console.warn('⚠️ Supabase URL or Service Key is unconfigured. Running DB in Mock Fallback Mode.');
 }
 
+// Auto-bootstrap: ensure all required tables and storage bucket exist on startup
+async function bootstrapDatabase() {
+  if (!supabaseAdmin) return;
+
+  console.log('🔧 Bootstrapping Supabase schema...');
+
+  // --- Ensure storage bucket 'scans' exists ---
+  try {
+    const { data: buckets } = await supabaseAdmin.storage.listBuckets();
+    const bucketExists = buckets && buckets.some(b => b.name === 'scans');
+    if (!bucketExists) {
+      const { error: bucketErr } = await supabaseAdmin.storage.createBucket('scans', { public: true });
+      if (bucketErr) {
+        console.error('❌ Failed to create storage bucket "scans":', bucketErr.message);
+      } else {
+        console.log('✅ Storage bucket "scans" created.');
+      }
+    } else {
+      console.log('✅ Storage bucket "scans" already exists.');
+    }
+  } catch (e) {
+    console.warn('⚠️ Could not verify/create storage bucket:', e.message);
+  }
+
+  // --- Ensure DB tables exist via Supabase REST (using raw SQL through the pg RPC) ---
+  // We use a try/insert probe to check table existence instead of raw SQL
+  // because the REST API doesn't expose DDL directly without pg_net or a custom function.
+  const tableChecks = [
+    {
+      table: 'scans',
+      create: `
+        create table if not exists public.scans (
+          id                    uuid primary key default gen_random_uuid(),
+          image_url             text not null,
+          thumbnail_url         text,
+          image_storage_path    text,
+          session_id            text,
+          object_type           text,
+          confidence            numeric(5,4),
+          is_ewaste             boolean default false,
+          waste_category        text,
+          material              text,
+          condition             text,
+          hazard_level          text,
+          hazard_reasons        jsonb,
+          reuse_suggestions     jsonb,
+          recycling_instructions text,
+          decomposition_years   integer,
+          co2_saved_kg          numeric(10,4),
+          gemini_response       jsonb,
+          created_at            timestamp with time zone default now(),
+          updated_at            timestamp with time zone
+        );
+        create index if not exists idx_scans_session_id on public.scans(session_id);
+      `
+    },
+    {
+      table: 'analytics_events',
+      create: `
+        create table if not exists public.analytics_events (
+          id          uuid primary key default gen_random_uuid(),
+          session_id  text,
+          event_type  text,
+          event_data  jsonb,
+          created_at  timestamp with time zone default now()
+        );
+      `
+    },
+    {
+      table: 'facilities',
+      create: `
+        create table if not exists public.facilities (
+          id             text primary key,
+          name           text not null,
+          type           text,
+          latitude       numeric(10,6),
+          longitude      numeric(10,6),
+          address        text,
+          verified       boolean default false,
+          accepted_waste jsonb,
+          created_at     timestamp with time zone default now()
+        );
+      `
+    }
+  ];
+
+  for (const { table, create } of tableChecks) {
+    try {
+      // Probe: try to select 0 rows – if the table is missing PostgREST returns PGRST205
+      const { error } = await supabaseAdmin.from(table).select('id').limit(0);
+      if (error && error.code === 'PGRST205') {
+        // Table is missing – use pg_net / raw SQL via the management API if available
+        // For now, log the SQL the user should run manually
+        console.warn(`⚠️  Table "public.${table}" not found. Please run the following SQL in Supabase SQL Editor:\n\n${create}`);
+      } else {
+        console.log(`✅ Table "public.${table}" is ready.`);
+      }
+    } catch (e) {
+      console.warn(`⚠️  Could not verify table "${table}":`, e.message);
+    }
+  }
+
+  console.log('🔧 Bootstrap complete.');
+}
+
+
 // Initialize Gemini SDK
 const geminiApiKey = process.env.GEMINI_API_KEY;
 let genAI = null;
@@ -69,8 +175,59 @@ const localScanStore = new Map();
 const localDecisionsStore = [];
 
 // ==========================================
+// GEMINI MODEL FALLBACK CHAIN
+// Tries models in order; skips on 429 (rate-limit) or 404 (not found)
+// ==========================================
+const GEMINI_MODEL_CHAIN = [
+  process.env.GEMINI_MODEL || 'gemini-1.5-flash',
+  'gemini-1.5-flash-002',
+  'gemini-2.0-flash-lite',
+  'gemini-2.0-flash',
+  'gemini-1.5-pro',
+  'gemini-1.5-pro-002',
+  'gemini-2.0-flash-exp',
+  'gemini-exp-1206'
+];
+
+async function callGemini(promptParts) {
+  if (!genAI) throw new Error('Gemini AI SDK is not initialised. Check GEMINI_API_KEY.');
+
+  let lastError = null;
+  for (const modelName of GEMINI_MODEL_CHAIN) {
+    try {
+      console.log(`🤖 Trying Gemini model: ${modelName}`);
+      const model = genAI.getGenerativeModel({
+        model: modelName,
+        generationConfig: {
+          temperature: 0.2,
+          maxOutputTokens: 1024,
+          responseMimeType: 'application/json'
+        }
+      });
+      const result = await model.generateContent(promptParts);
+      const text = result.response.text();
+      console.log(`✅ Gemini success with model: ${modelName}`);
+      return JSON.parse(text);
+    } catch (err) {
+      const status = err.status || err.statusCode || 0;
+      const isRateLimit = status === 429 || (err.message && err.message.includes('429'));
+      const isNotFound  = status === 404 || (err.message && err.message.includes('not found'));
+      if (isRateLimit || isNotFound) {
+        console.warn(`⚠️  Model ${modelName} unavailable (${status}), trying next…`);
+        lastError = err;
+        continue; // try the next model
+      }
+      // Any other error (auth, bad payload, etc.) — throw immediately
+      throw err;
+    }
+  }
+  throw lastError || new Error('All Gemini models failed or are rate-limited.');
+}
+
+// ==========================================
 // API ROUTES
 // ==========================================
+
 
 // 1. Health check endpoint
 app.get('/api/health', (req, res) => {
@@ -218,25 +375,22 @@ app.post('/api/scan', async (req, res) => {
     // Prepare response structure
     let geminiResult = null;
 
-    if (genAI && base64ToUse) {
-      // Production path: Execute Gemini Multi-modal vision analysis
-      try {
-        const model = genAI.getGenerativeModel({
-          model: process.env.GEMINI_MODEL || 'gemini-1.5-pro',
-          generationConfig: {
-            temperature: 0.2,
-            maxOutputTokens: 1024,
-            responseMimeType: "application/json"
-          }
-        });
+    if (!genAI) {
+      return res.status(503).json({ error: 'Gemini AI is not configured. Please set GEMINI_API_KEY in your .env file.' });
+    }
+    if (!base64ToUse) {
+      return res.status(400).json({ error: 'imageBase64 is required for AI analysis.' });
+    }
 
-        // Strip headers from base64 if present
-        let cleanBase64 = base64ToUse;
-        if (base64ToUse.startsWith('data:')) {
-          cleanBase64 = base64ToUse.split(',')[1];
-        }
+    // Use callGemini which tries multiple models automatically
+    try {
+      // Strip headers from base64 if present
+      let cleanBase64 = base64ToUse;
+      if (base64ToUse.startsWith('data:')) {
+        cleanBase64 = base64ToUse.split(',')[1];
+      }
 
-        const prompt = `You are Resiklo, an advanced eco-friendly waste management AI. Analyze the uploaded photo of an object.
+      const prompt = `You are Resiklo, an advanced eco-friendly waste management AI. Analyze the uploaded photo of an object.
 Analyze the image and return a JSON object with the following fields:
 {
   "objectType": "string (common name of the item)",
@@ -256,49 +410,13 @@ Analyze the image and return a JSON object with the following fields:
   }
 }`;
 
-        const imagePart = {
-          inlineData: {
-            data: cleanBase64,
-            mimeType: "image/jpeg"
-          }
-        };
+      const imagePart = { inlineData: { data: cleanBase64, mimeType: 'image/jpeg' } };
+      geminiResult = await callGemini([prompt, imagePart]);
+      console.log('Gemini Analysis Response:', geminiResult);
 
-        const result = await model.generateContent([prompt, imagePart]);
-        const responseText = result.response.text();
-        geminiResult = JSON.parse(responseText);
-        console.log('Gemini Analysis Response:', geminiResult);
-
-      } catch (geminiErr) {
-        console.error('Gemini direct API call exception, falling back to mock analysis:', geminiErr);
-      }
-    }
-
-    // Fallback Mock data if Gemini is disabled or crashed
-    if (!geminiResult) {
-      const isEwasteMock = scanRecord.image_url.includes('electronics') || scanRecord.image_url.includes('battery');
-      geminiResult = {
-        objectType: isEwasteMock ? 'Old Mobile Phone' : 'Plastic Mineral Water Bottle',
-        wasteCategory: isEwasteMock ? 'electronic' : 'plastic',
-        material: isEwasteMock ? 'Silicon, Glass & Lithium' : 'PET Plastic (Type 1)',
-        condition: 'fair',
-        confidence: 0.94,
-        isEwaste: isEwasteMock,
-        hazardLevel: isEwasteMock ? 'medium' : null,
-        hazardReasons: isEwasteMock ? ['Lithium battery degradation risk', 'Heavy metals components'] : [],
-        reuseSuggestions: isEwasteMock 
-          ? ['Repurpose as a dedicated alarm clock or media controller', 'Donate to schools for hardware parts labs', 'Use as an offline dashcam or navigation screen']
-          : ['Create a self-watering desk planter for small plants', 'Convert into a simple storage holder for stationery', 'Construct a localized bird feeder for gardens'],
-        recyclingInstructions: isEwasteMock
-          ? 'Do not throw in general bins. Remove SIM card, wrap in protective packing, and locate specialized local e-waste sorting hubs.'
-          : 'Wash thoroughly with soap. Peel off paper labels if possible. Crush to minimize volume, keep the cap separate, and drop in plastics bin.',
-        environmentalImpact: {
-          decompositionYears: isEwasteMock ? 1000 : 450,
-          co2SavedByRecycling: isEwasteMock ? '2.3kg' : '0.12kg',
-          impactStatement: isEwasteMock
-            ? 'Recycling cellphones recovers valuable copper, silver, and gold while preventing soil toxicity from heavy metals.'
-            : 'Recycling standard PET bottles saves high amounts of raw petroleum energy and keeps plastics out of oceanic ecosystems.'
-        }
-      };
+    } catch (geminiErr) {
+      console.error('Gemini analysis error:', geminiErr);
+      return res.status(502).json({ error: 'Gemini AI analysis failed: ' + (geminiErr.message || 'Unknown error') });
     }
 
     // 3. Update Database row
@@ -375,6 +493,261 @@ Analyze the image and return a JSON object with the following fields:
   } catch (error) {
     console.error('Scan analysis controller error:', error);
     res.status(500).json({ error: error.message || 'An unexpected error occurred during AI analysis' });
+  }
+});
+
+// 3.1. Initiate Scan Image analysis and dynamic survey generation using Gemini AI
+app.post('/api/scan/initiate', async (req, res) => {
+  try {
+    const { scanId, imageBase64 } = req.body;
+    if (!scanId) {
+      return res.status(400).json({ error: 'scanId is a required parameter' });
+    }
+
+    let scanRecord = null;
+    let base64ToUse = imageBase64;
+
+    // Fetch scan metadata
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from('scans')
+        .select('*')
+        .eq('id', scanId)
+        .single();
+      
+      if (error || !data) {
+        return res.status(404).json({ error: 'Scan record not found in Supabase' });
+      }
+      scanRecord = data;
+    } else {
+      scanRecord = localScanStore.get(scanId);
+      if (!scanRecord) {
+        return res.status(404).json({ error: 'Scan record not found in mock store' });
+      }
+    }
+
+    let result = null;
+
+    if (!genAI) {
+      return res.status(503).json({ error: 'Gemini AI is not configured. Please set GEMINI_API_KEY in your .env file.' });
+    }
+    if (!base64ToUse) {
+      return res.status(400).json({ error: 'imageBase64 is required to run the AI scan.' });
+    }
+
+    // Use callGemini which tries multiple models automatically
+    try {
+      let cleanBase64 = base64ToUse;
+      if (base64ToUse.startsWith('data:')) {
+        cleanBase64 = base64ToUse.split(',')[1];
+      }
+
+      const prompt = `You are Resiklo, an advanced eco-friendly waste management AI. Analyze the uploaded photo.
+Identify the object type and generate exactly 3 clarifying multiple-choice questions to ask the user.
+These questions should help confirm the specific state, cleanliness, material structure, or details of the object to ensure a highly reliable recycling or reuse decision.
+Return a JSON object with the following fields:
+{
+  "objectType": "string (name of identified item, e.g. Plastic Bottle, Laptop, Newspaper)",
+  "confidence": number (estimated identification accuracy from 0.0 to 1.0),
+  "isEwaste": boolean (true if electronic waste),
+  "questions": [
+    {
+      "id": "string (unique question slug, e.g. cleanliness, battery_removable, label_present)",
+      "title": "string (clear, user-friendly question, e.g. Is the bottle clean and rinsed?)",
+      "description": "string (brief context or reason, e.g. Leftover liquids contaminate plastics.)",
+      "options": [
+        { "value": "string (lowercased short answer, e.g. clean, dirty)", "label": "string (user-friendly label, e.g. Yes, completely rinsed)" }
+      ]
+    }
+  ]
+}`;
+
+      const imagePart = { inlineData: { data: cleanBase64, mimeType: 'image/jpeg' } };
+      result = await callGemini([prompt, imagePart]);
+      console.log('Gemini Initiate Response:', result);
+
+    } catch (geminiErr) {
+      console.error('Gemini initiate error:', geminiErr);
+      return res.status(502).json({ error: 'Gemini AI scan failed: ' + (geminiErr.message || 'Unknown error') });
+    }
+
+    // Save dynamic questions inside scan record (gemini_response JSON field)
+    if (supabaseAdmin) {
+      await supabaseAdmin
+        .from('scans')
+        .update({
+          object_type: result.objectType,
+          confidence: result.confidence,
+          is_ewaste: result.isEwaste,
+          gemini_response: { ...scanRecord.gemini_response, questions: result.questions },
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', scanId);
+    } else {
+      localScanStore.set(scanId, {
+        ...scanRecord,
+        object_type: result.objectType,
+        confidence: result.confidence,
+        is_ewaste: result.isEwaste,
+        gemini_response: { ...scanRecord.gemini_response, questions: result.questions }
+      });
+    }
+
+    res.json({
+      success: true,
+      scanId,
+      objectType: result.objectType,
+      confidence: Math.round(result.confidence * 100),
+      isEwaste: result.isEwaste,
+      questions: result.questions
+    });
+
+  } catch (error) {
+    console.error('Scan initiate error:', error);
+    res.status(500).json({ error: error.message || 'Failed to initiate dynamic survey' });
+  }
+});
+
+// 3.2. Finalize Scan Image analysis with Survey answers using Gemini AI
+app.post('/api/scan/finalize', async (req, res) => {
+  try {
+    const { scanId, answers, imageBase64 } = req.body;
+    if (!scanId) {
+      return res.status(400).json({ error: 'scanId is a required parameter' });
+    }
+    if (!answers) {
+      return res.status(400).json({ error: 'answers is a required parameter' });
+    }
+
+    let scanRecord = null;
+    let base64ToUse = imageBase64;
+
+    // Fetch scan metadata
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from('scans')
+        .select('*')
+        .eq('id', scanId)
+        .single();
+      
+      if (error || !data) {
+        return res.status(404).json({ error: 'Scan record not found in Supabase' });
+      }
+      scanRecord = data;
+    } else {
+      scanRecord = localScanStore.get(scanId);
+      if (!scanRecord) {
+        return res.status(404).json({ error: 'Scan record not found in mock store' });
+      }
+    }
+
+    const objectType = scanRecord.object_type || 'Object';
+    const questions = scanRecord.gemini_response?.questions || [];
+
+    // Construct survey results description for Gemini prompt
+    const surveyText = questions.map(q => {
+      const selectedValue = answers[q.id] || 'unanswered';
+      const selectedOption = q.options?.find(o => o.value === selectedValue);
+      const selectedLabel = selectedOption ? selectedOption.label : selectedValue;
+      return `- Question: "${q.title}"\n  Answer: "${selectedLabel}" (value: "${selectedValue}")`;
+    }).join('\n');
+
+    let result = null;
+
+    if (!genAI) {
+      return res.status(503).json({ error: 'Gemini AI is not configured. Please set GEMINI_API_KEY in your .env file.' });
+    }
+    if (!base64ToUse) {
+      return res.status(400).json({ error: 'imageBase64 is required for final analysis.' });
+    }
+
+    // Use callGemini which tries multiple models automatically
+    try {
+      let cleanBase64 = base64ToUse;
+      if (base64ToUse.startsWith('data:')) {
+        cleanBase64 = base64ToUse.split(',')[1];
+      }
+
+      const prompt = `You are Resiklo, an advanced eco-friendly waste management AI.
+We previously identified this object as a ${objectType}.
+The user has completed a short verification survey about the item. Here are their answers:
+${surveyText}
+
+Based on the image and these survey answers, perform a final detailed waste analysis and return the final recommendations in JSON format:
+{
+  "item": "string (e.g. Plastic Bottle · PET #1, Broken Phone · Lithium Battery)",
+  "confidence": number (e.g. 96, between 0 and 100),
+  "condition": "string (e.g. Reusable, Recyclable, Damaged, Soiled)",
+  "hazard": "string (High | Medium | Low | null)",
+  "reuse": [
+    {
+      "title": "string (e.g. Vertical Garden)",
+      "desc": "string (e.g. Cut in half to create hanging planters.)",
+      "icon": "string (Sprout | Droplets | PenTool | Leaf | Wrench | Heart | Recycle)"
+    }
+  ],
+  "repair": [
+    {
+      "title": "string (optional repair recommendation)",
+      "desc": "string",
+      "icon": "string"
+    }
+  ],
+  "donate": [
+    {
+      "title": "string (optional donation recommendation)",
+      "desc": "string",
+      "icon": "string"
+    }
+  ],
+  "recycle": "string (recycling instructions, e.g. Rinse and crush before placing in the blue bin.)",
+  "impact": "string (compelling float representation of saved CO2 in kg, e.g. 0.08)"
+}`;
+
+      const imagePart = { inlineData: { data: cleanBase64, mimeType: 'image/jpeg' } };
+      result = await callGemini([prompt, imagePart]);
+      console.log('Gemini Finalize Response:', result);
+
+    } catch (geminiErr) {
+      console.error('Gemini finalize error:', geminiErr);
+      return res.status(502).json({ error: 'Gemini AI finalization failed: ' + (geminiErr.message || 'Unknown error') });
+    }
+
+    // Update database row with final analysis
+    if (supabaseAdmin) {
+      await supabaseAdmin
+        .from('scans')
+        .update({
+          condition: result.condition,
+          confidence: result.confidence / 100,
+          hazard_level: result.hazard,
+          recycling_instructions: result.recycle,
+          co2_saved_kg: parseFloat(result.impact) || 0,
+          gemini_response: { ...scanRecord.gemini_response, answers, final_analysis: result },
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', scanId);
+    } else {
+      localScanStore.set(scanId, {
+        ...scanRecord,
+        condition: result.condition,
+        confidence: result.confidence / 100,
+        hazard_level: result.hazard,
+        recycling_instructions: result.recycle,
+        co2_saved_kg: parseFloat(result.impact) || 0,
+        gemini_response: { ...scanRecord.gemini_response, answers, final_analysis: result }
+      });
+    }
+
+    res.json({
+      success: true,
+      scanId,
+      ...result
+    });
+
+  } catch (error) {
+    console.error('Scan finalize error:', error);
+    res.status(500).json({ error: error.message || 'Failed to finalize dynamic analysis' });
   }
 });
 
@@ -589,4 +962,7 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
 // Start Server listener
 app.listen(PORT, () => {
   console.log(`🚀 Resiklo Secure Proxy Backend is running on http://localhost:${PORT}`);
+  // Run startup checks: verify/create storage bucket & probe DB tables
+  bootstrapDatabase().catch(e => console.error('Bootstrap error:', e.message));
 });
+
