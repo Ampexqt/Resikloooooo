@@ -386,11 +386,9 @@ app.get('/api/facilities', async (req, res) => {
     const type = req.query.type || '';
     const radius = parseFloat(req.query.radius) || 10; // in km
 
-    const searchUrl = `https://maps.googleapis.com/maps/api/place/nearbysearch/json?location=${lat},${lng}&radius=${radius * 1000}&type=recycling_center&key=${process.env.GOOGLE_MAPS_API_KEY}`;
-
     let facilities = [];
 
-    // Production: Try calling DB + Google Places
+    // Production: Try calling DB
     if (supabaseAdmin) {
       try {
         let dbQuery = supabaseAdmin.from('facilities').select('*').eq('verified', true);
@@ -410,31 +408,36 @@ app.get('/api/facilities', async (req, res) => {
       }
     }
 
-    // Google Places Lookup fallback if low numbers
-    const placesKey = process.env.GOOGLE_MAPS_API_KEY;
-    if (facilities.length < 5 && placesKey && !placesKey.includes('your_google_maps')) {
+    // Mapbox Search Box API Lookup fallback if low numbers
+    const mapboxToken = process.env.MAPBOX_ACCESS_TOKEN;
+    if (facilities.length < 5 && mapboxToken && !mapboxToken.includes('your_mapbox_access_token')) {
       try {
+        const query = type === 'ewaste' ? 'electronic waste recycling' : (type || 'recycling center');
+        const searchUrl = `https://api.mapbox.com/search/searchbox/v1/forward?q=${encodeURIComponent(query)}&proximity=${lng},${lat}&limit=10&access_token=${mapboxToken}`;
+
         const response = await fetch(searchUrl);
         const data = await response.json();
-        if (data.results) {
-          const places = data.results.map(place => {
-            const distance = calculateDistance(lat, lng, place.geometry.location.lat, place.geometry.location.lng);
+        if (data.features) {
+          const places = data.features.map(feature => {
+            const featureLng = feature.geometry.coordinates[0];
+            const featureLat = feature.geometry.coordinates[1];
+            const distance = calculateDistance(lat, lng, featureLat, featureLng);
             return {
-              id: place.place_id,
-              name: place.name,
+              id: feature.properties.mapbox_id || feature.id,
+              name: feature.properties.name || feature.text || 'Recycling Center',
               type: type || 'recycling',
-              latitude: place.geometry.location.lat,
-              longitude: place.geometry.location.lng,
+              latitude: featureLat,
+              longitude: featureLng,
               distance: parseFloat(distance.toFixed(2)),
-              address: place.vicinity || 'Local Manila Area',
+              address: feature.properties.full_address || feature.properties.address || 'Local Area',
               verified: false,
-              accepted_waste: ['plastic', 'paper', 'glass', 'metal']
+              accepted_waste: type === 'ewaste' ? ['electronics', 'batteries', 'chargers', 'phones'] : ['plastic', 'paper', 'glass', 'metal']
             };
           });
           facilities = [...facilities, ...places];
         }
-      } catch (placesErr) {
-        console.warn('Google Places fetch failed:', placesErr);
+      } catch (mapboxErr) {
+        console.warn('Mapbox Places fetch failed:', mapboxErr);
       }
     }
 
